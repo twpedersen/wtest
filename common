@@ -1,0 +1,580 @@
+#!/bin/bash
+
+_0=`basename $0`
+export ssh='ssh -o IPQoS=lowdelay -i tools/ssh_key'
+
+fail () {
+	echo FAIL: $*
+	cleanup
+}
+
+pass () {
+	echo PASS
+	cleanup &>/dev/null
+}
+
+# prune interfaces on $PHY
+# clean_phy $PHY
+clean_phy () {
+	_n=`echo $1 | sed 's/phy//'`
+	_phy="phy#$_n"
+
+	_IFS=`iw dev | grep $_phy -A 100 | grep -v $_phy | \
+	     sed '/^phy.*/,$d' | grep Interface | awk '{print $2}'`
+
+	for iface in $_IFS; do
+		sudo iw $iface interface del || fail
+	done
+}
+
+# if2ip <iface>
+if2ip () {
+
+        _IF=${1}
+
+        echo -n `ip addr show ${_IF} | grep -m 1 "inet" | awk '{print$2}' | cut -d'/' -f1`
+}
+
+# if2idx <iface>
+if2idx () {
+	echo -n `iw dev | grep $1 -A2 | grep "\<ifindex\>" | awk '{print $2}'`
+}
+
+# if2mac <iface>
+if2mac () {
+	echo -n `ip link show $1 | awk '/ether/ {print $2}'`
+}
+
+# increment_ip <ip>
+# TODO: roll over
+increment_ip () {
+
+	_b4=`echo $1 | cut -f4 -d'.'`
+	(( _b4 += 1))
+	echo $1 | sed "s/[[:digit:]]*$/$_b4/"
+}
+
+# assign new ip to $node from subnet defined in $bss
+# assign_ip <node> <bss>
+assign_ip () {
+
+	_node=$1
+	_bss=$2
+
+	# ready a new "unique" IP for this bss
+	eval $_bss[ip]=$(increment_ip $(eval echo \${$_bss[ip]}))
+	eval $_node[ip]=$(eval echo \${$_bss[ip]})
+}
+
+# bring up $node on node[if] with ip node[ip]
+# if_up $node
+if_up () {
+
+	_if=$(eval echo \${$1[if]})
+	_ip=$(eval echo \${$1[ip]})
+	_idx=`if2idx $_if`
+
+	# magic: accept packets with local source addresses, only reply to ARP
+	# requests on own interface, create new entries in ARP table for
+	# gratuitous ARPs, turn off forwarding (router) mode and rp_filter
+	echo "echo 1 > /proc/sys/net/ipv4/conf/$_if/accept_local" | sudo sh
+	echo "echo 1 > /proc/sys/net/ipv4/conf/$_if/arp_filter" | sudo sh
+	echo "echo 1 > /proc/sys/net/ipv4/conf/$_if/arp_accept" | sudo sh
+	echo "echo 0 > /proc/sys/net/ipv4/conf/$_if/forwarding" | sudo sh
+	echo "echo 0 > /proc/sys/net/ipv4/conf/$_if/rp_filter" | sudo sh
+
+	sudo ip address add dev $_if $_ip/24
+	sudo ip link set $_if up
+
+	# create a rule for packets originating from this local address to 
+	# be routed by a simpler table that just sends the packet to the
+	# interface without doing any checks on the destination address
+	sudo ip rule del prio 5$_idx 2> /dev/null
+	sudo ip rule add prio 5$_idx from $_ip/32 table 5$_idx
+
+	# create the simple table (50$i) that will be used for packets
+	# that match the previous rule
+	sudo ip route flush table 5$_idx 2>/dev/null
+	sudo ip route add default dev $_if table 5$_idx
+
+	# restore the local table for incoming traffic  so it's
+	# processed normally by the IP stack
+	sudo ip rule del prio $_idx 2>/dev/null
+	sudo ip rule add prio $_idx iif $_if lookup local
+}
+
+# create new $if on $phy specified in $node
+# if_add $node
+if_add () {
+
+	# yes bash sucks, but this is hidden from the user, so it's ok
+	_if=$(eval echo \${$1[if]})
+	_phy=$(eval echo \${$1[phy]})
+
+	iw dev | grep "Interface $_if" >/dev/null && return
+	sudo iw $_phy interface add $_if type managed
+}
+
+# apply BSS described in $bss to $node, and set node-specific parameters
+# set_bss $node $bss
+set_bss () {
+
+	_node=$1
+	_bss=$2
+
+	# get new ip this bss
+	assign_ip $_node $_bss
+	eval $_node[bss]=$_bss
+}
+
+# move $phy to new netns and return PID
+# new_netns $phy $script
+new_netns () {
+
+	$_phy=$1
+	$_script=$2
+
+	echo "\
+source common
+iw phy $_phy set netns \$BASHPID
+$_script
+sleep 1000000" > /tmp/$_phy_ns.sh
+
+	sudo unshare -n -- /bin/bash /tmp/$_phy_ns.sh &
+	echo $!
+}
+
+# start iperf session from node a -> b
+# start_straffic $a $b
+start_traffic () {
+
+	_ip_a=$(eval echo \${$1[ip]})
+	_ip_b=$(eval echo \${$2[ip]})
+	_sta_b=$(eval echo \${$2[if]})
+
+	iperf -s -B$_ip_b -u -i1 > log/iperf_${_0}_${_sta_b} &
+	sleep 2	# wait for server to start
+	iperf -B $_ip_a -c $_ip_b -fm -i1 -t1000000 -u -b100M > /dev/null &
+}
+
+# associate STA described in $node
+# start_sta $node
+start_sta () {
+
+	_bss=$(eval echo \${$1[bss]})
+	_if=$(eval echo \${$1[if]})
+	_ssid=$(eval echo \${$_bss[ssid]})
+	_sec=$(eval echo \${$_bss[security]})
+	_key=$(eval echo \${$_bss[key]})
+
+	WPA_S_CONF=log/wpa_s_${_0}_${_if}.conf
+	_wpa_ctl_if=/var/run/wpa_supplicant_$_if
+	eval $_if[wpa_ctl_if]=$_wpa_ctl_if
+
+echo "\
+ctrl_interface=$_wpa_ctl_if
+network={
+	ssid=\"$_ssid\"
+" > $WPA_S_CONF
+
+	case "$_sec" in
+		none) echo "key_mgmt=NONE" >> $WPA_S_CONF
+			;;
+		wep) echo "key_mgmt=NONE
+wep_key0=$_key" >> $WPA_S_CONF
+			;;
+		wpa|wpa2) echo "psk=\"$_key\"" >> $WPA_S_CONF
+			;;
+		*) echo "wap_s error: unknown security suite!"
+			;;
+	esac
+
+	echo "}" >> $WPA_S_CONF
+	if_add $1
+	sudo wpa_supplicant -Dnl80211 -i $_if -c $WPA_S_CONF -dd -t &> log/wpa_s_${_0}_${_if}.log &
+	eval $_if[sta_pid]=$!
+	# TODO: wait_for_link
+	sleep 1
+	if_up $1
+}
+
+stop_sta () {
+
+	_pid=$(eval echo \${$1[sta_pid]})
+	sudo kill $_pid
+}
+
+FREQS=( 0 2412 2417 2422 2427 2432 2437 2442 2447 2452 2457 2462 )
+
+# XXX: security, hidden SSID, 11n _BROKEN_
+# bring up AP with conf specified in $node
+# start_ap $node
+start_wpa_ap () {
+
+	_bss=$(eval echo \${$1[bss]})
+	_if=$(eval echo \${$1[if]})
+	_ssid=$(eval echo \${$_bss[ssid]})
+	_sec=$(eval echo \${$_bss[security]})
+	_key=$(eval echo \${$_bss[key]})
+	_cipher=$(eval echo \${$_bss[cipher]})
+	_ch=$(eval echo \${$_bss[channel]})
+	_11n=$(eval echo \${$_bss[11n]})
+	_hidden=$(eval echo \${$_bss[hidden]})
+	_country=$(eval echo \${$_bss[country]})
+
+	_wmm=0
+	if [ $_11n = "1" ]; then
+		_wmm=1
+	fi
+
+	# XXX: get supported list of channels from if
+	if [[ $_ch -ge 1 && $_ch -le 11 ]]; then
+		_mode=g
+	elif [[ $_ch -ge 36 && $_ch -le 165 ]]; then
+		_mode=a
+	else
+		echo "start_ap: invalid channel!" && fail
+	fi
+	freq=${FREQS[$_ch]}
+
+	[[ -z "$_hidden" ]] && _hidden=0
+
+	HOSTAPD_CONF=log/hostapd_${_0}_${_if}.conf
+echo "\
+ctrl_interface=/var/run/wpa_supplicant_ap_$_if
+network={
+mode=2
+ssid=\"$_ssid\"
+frequency=$freq
+" > $HOSTAPD_CONF
+
+	case "$_sec" in
+		none)
+			echo "key_mgmt=NONE" >> $HOSTAPD_CONF
+			;;
+		# XXX: fix WEP case!
+		wep)	echo "key_mgmt=NONE
+wep_key0=${_key}" >> $HOSTAPD_CONF
+			;;
+		wpa|wpa2)
+			echo "proto=`echo $_sec | tr [:lower:] [:upper:]`
+psk=\"$_key\"
+key_mgmt=WPA-PSK
+pairwise=$_cipher
+group=$_cipher" >> $HOSTAPD_CONF
+			;;
+		*) echo "error: unknown security suite"
+			fail
+			;;
+	esac
+
+echo } >> $HOSTAPD_CONF
+
+	[ ! -z "$_country" ] && {
+	echo "\
+ieee80211d=1
+country_code=$country" >> $HOSTAPD_CONF
+	}
+
+	if_add $1
+	sudo wpa_supplicant -Dnl80211 -dd -t -c $HOSTAPD_CONF -i $_if > log/hostapd_${_0}_${_if}.log &
+	eval $1[ap_pid]=$!
+	sleep 1
+	if_up $1
+}
+
+start_hostapd () {
+	
+	_bss=$(eval echo \${$1[bss]})
+        _if=$(eval echo \${$1[if]})
+        _ssid=$(eval echo \${$_bss[ssid]})
+        _sec=$(eval echo \${$_bss[security]})
+        _key=$(eval echo \${$_bss[key]})
+        _cipher=$(eval echo \${$_bss[cipher]})
+        _ch=$(eval echo \${$_bss[channel]})
+        _11n=$(eval echo \${$_bss[11n]})
+        _hidden=$(eval echo \${$_bss[hidden]})
+        _country=$(eval echo \${$_bss[country]})
+
+        _wmm=0
+        if [ $_11n = "1" ]; then
+                _wmm=1
+        fi
+
+        # XXX: get supported list of channels from if
+        if [[ $_ch -ge 1 && $_ch -le 11 ]]; then
+                _mode=g
+        elif [[ $_ch -ge 36 && $_ch -le 165 ]]; then
+                _mode=a
+        else
+                echo "start_ap: invalid channel!" && fail
+        fi
+
+        [[ -z "$_hidden" ]] && _hidden=0
+
+        HOSTAPD_CONF=log/hostapd_${_0}_${_if}.conf
+echo "\
+interface=$_if
+ssid=$_ssid
+ignore_broadcast_ssid=$_hidden
+hw_mode=$_mode
+channel=$_ch
+ieee80211n=$_11n
+wmm_enabled=$_wmm
+wmm_ac_bk_cwmin=4
+wmm_ac_bk_cwmax=10
+wmm_ac_bk_aifs=7
+wmm_ac_bk_txop_limit=0
+wmm_ac_bk_acm=0
+wmm_ac_be_aifs=3
+wmm_ac_be_cwmin=4
+wmm_ac_be_cwmax=10
+wmm_ac_be_txop_limit=0
+wmm_ac_be_acm=0
+wmm_ac_vi_aifs=2
+wmm_ac_vi_cwmin=3
+wmm_ac_vi_cwmax=4
+wmm_ac_vi_txop_limit=94
+wmm_ac_vi_acm=0
+wmm_ac_vo_aifs=2
+wmm_ac_vo_cwmin=2
+wmm_ac_vo_cwmax=3
+wmm_ac_vo_txop_limit=47
+wmm_ac_vo_acm=0
+" > $HOSTAPD_CONF
+
+        case "$_sec" in
+                none)   # do nothing
+                        ;;
+                wep)    echo "wep_default_key=0
+wep_key0=${_key}" >> $HOSTAPD_CONF
+                        ;;
+                wpa)    _wpa_bit=1
+                        ;&
+                wpa2)   [[ -n "$_wpa_bit" ]] || _wpa_bit=2
+                        echo "wpa=$_wpa_bit
+wpa_passphrase=$_key
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=$_cipher" >> $HOSTAPD_CONF
+                        ;;
+                *) echo "error: unknown security suite"
+                        fail
+                        ;;
+        esac
+
+	[ ! -z "$_country" ] && {
+	echo "\
+ieee80211d=1
+country_code=$_country" >> $HOSTAPD_CONF
+	}
+
+        if_add $1
+        sudo hostapd -dd -t $HOSTAPD_CONF > log/hostapd_${_0}_${_if}.log &
+	eval $1[ap_pid]=$!
+        sleep 1
+	if_up $1
+}
+
+# shit hack: wpa_s AP + our current reference PHYs are broken
+start_ap () {
+
+	if [[ "$1" == *ref_ap* ]]
+	then
+		start_hostapd $1
+	else
+		start_wpa_ap $1
+	fi
+}
+
+stop_ap () {
+
+	_pid=$(eval echo \${$1[ap_pid]})
+	_if=$(eval echo \${$1[if]})
+	sudo kill $_pid
+	sudo ip link set $_if down
+}
+
+# Associate $sta node with $ap node. This means adding the necessary
+# interfaces, grabbing $ap's bss conf, and correctly configuring the IP stack
+# assoc $sta $ap
+assoc () {
+
+	_sta=$1
+	_ap=$2
+	_bss=$(eval echo \${$_ap[bss]})
+
+	set_bss $_sta $_bss
+
+	start_ap $_ap
+	start_sta $_sta
+}
+
+# check $node is associated as specified in its bss
+# check_assoc $node
+check_assoc () {
+
+	local if=$(eval echo \${$1[if]})
+	local bss=$(eval echo \${$1[bss]})
+	local ssid=$(eval echo \${$bss[ssid]})
+
+	SSID=`iw $if link | grep Connected -A 1 | grep SSID` || fail "$1 not associated"
+	[[ $ssid -eq "$(echo $SSID | cut -d ' ' -f2)" ]] || fail "$1 wrong ssid!"
+}
+
+# check ping a -> b
+# check_ping $a $b
+check_ping () {
+	local ifa=$(eval echo \${$1[if]})
+	local ipb=$(eval echo \${$2[ip]})
+
+	sudo ping -I$ifa $ipb -f -w4 -Q 0xf0 &>/dev/null || fail "ping $2 from $1"
+}
+
+# check L2 and L3 links between nodes $a and $b
+# XXX: will fail if $a is an AP...
+# check_link $a $b
+check_link () {
+
+	check_assoc $1
+	check_ping $1 $2
+}
+
+kill_routes () {
+
+	_ip=$(eval echo \${$1[ip]})
+	_if=$(eval echo \${$1[if]})
+
+	[[ -z $"$_ip" ]] && return
+	sudo ip route del to $_ip/24
+	sudo ip rule del from $_ip
+	sudo ip rule del iif $_if
+}
+
+
+cleanup () {
+	dmesg > log/dmesg_$_0
+	sudo killall iperf &> /dev/null
+	sudo killall hostapd &> /dev/null
+	sudo killall wpa_supplicant &> /dev/null
+	# clean up ip tables
+	# TODO: generalize this to a list of IFs
+	kill_routes ref_sta
+	kill_routes dev_sta
+	kill_routes ref_ap
+	kill_routes dev_ap
+	sudo ip rule add priority 0 from all lookup local
+	sudo ip rule del prio 1000
+	exit
+}
+
+trap "cleanup" INT TERM
+
+# 0x1000 must be here for host reporting
+# INF		0x0001
+# WMI		0x0002
+# MISC		0x0004
+# PM		0x0008
+# TXRX_MGMTBUF	0x0010
+# TXRX_TXBUF	0x0020
+# TXRX_RXBUF	0x0040
+# WOW		0x0080
+# WHAL		0x0100
+# DC		0x0200
+# CO		0x0400
+# RO		0x0800
+# CM		0x1000
+# MGMT		0x2000
+# TMR		0x4000
+# BTCOEX	0x8000
+ATH6KL_FW_DEBUG_MASK=0x3605
+
+DEV_DRIVER=ath6kl
+REF_DRIVER=ath9k_htc
+
+sudo /etc/init.d/network-manager stop &> /dev/null
+./reload_modules
+
+# move local routing table to lower priority in preparation to the new routing
+# tables that we create later
+sudo ip rule add priority 10000 table local
+sudo ip rule del priority 0 &> /dev/null
+
+# only reply to ARP requests for addresses configured on the device
+echo "echo 1 > /proc/sys/net/ipv4/conf/all/arp_ignore" | sudo sh
+
+# udev gets in the way
+sudo rm /etc/udev/rules.d/70-persistent-net.rules &> /dev/null
+
+DEV_PHY=`sudo find /sys/kernel/debug/ieee80211 -type d -name $DEV_DRIVER | cut -d '/' -f 6`
+REF_PHYS=`sudo find /sys/kernel/debug/ieee80211 -type d -name $REF_DRIVER | cut -d '/' -f 6`
+REF_PHY1=`echo $REF_PHYS | awk '{print $1}'`
+REF_PHY2=`echo $REF_PHYS | awk '{print $2}'`
+
+
+# Some BSSes
+declare -A bss_1
+bss_1[ssid]=bss_1
+bss_1[ip]=10.10.10.0
+bss_1[security]=none
+bss_1[channel]=6
+bss_1[11n]=0
+
+declare -A bss_2
+bss_2[ssid]=bss_2
+bss_2[ip]=10.10.11.0
+bss_2[security]=none
+bss_2[channel]=6
+bss_2[11n]=0
+
+# Some default node configurations for local host
+# APs carry an implicit BSS configuration which will be copied to the sta
+# node in assoc()
+#
+# dev AP
+declare -A dev_ap
+dev_ap[if]=ath6kl_ap
+dev_ap[phy]=$DEV_PHY
+set_bss dev_ap bss_1
+
+# dev AP #2
+declare -A dev_ap2
+dev_ap2[if]=ath6kl_ap2
+dev_ap2[phy]=$DEV_PHY
+set_bss dev_ap2 bss_2
+
+# reference AP
+declare -A ref_ap
+ref_ap[if]=ref_ap
+ref_ap[phy]=$REF_PHY2
+set_bss ref_ap bss_2
+
+# reference AP $2
+declare -A ref_ap2
+ref_ap2[if]=ref_ap2
+ref_ap2[phy]=$REF_PHY1
+set_bss ref_ap2 bss_1
+
+# reference STA
+declare -A ref_sta
+ref_sta[if]=ref_sta
+ref_sta[phy]=$REF_PHY1
+
+# reference STA #2
+declare -A ref_sta2
+ref_sta2[if]=ref_sta2
+ref_sta2[phy]=$REF_PHY2
+
+# dev STA
+declare -A dev_sta
+dev_sta[if]=ath6kl_sta
+dev_sta[phy]=$DEV_PHY
+
+# dev STA #2
+declare -A dev_sta2
+dev_sta2[if]=ath6kl_sta2
+dev_sta2[phy]=$DEV_PHY
+
+# let user create their own ifs
+clean_phy $DEV_PHY
+clean_phy $REF_PHY1
+clean_phy $REF_PHY2
